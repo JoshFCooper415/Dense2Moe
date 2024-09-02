@@ -3,9 +3,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from datasets import load_dataset
 from typing import Dict, List
-import copy
 import gc
-
+import flora_opt
 class OpenHermesDataset(Dataset):
     def __init__(self, data: List[Dict], tokenizer: AutoTokenizer, max_length: int):
         self.data = data
@@ -19,12 +18,8 @@ class OpenHermesDataset(Dataset):
         item = self.data[idx]
         conversation = item['conversations']
         
-        formatted_text = ""
-        for turn in conversation:
-            if turn['from'] == 'human':
-                formatted_text += f"Human: {turn['value']}\n\n"
-            elif turn['from'] == 'gpt':
-                formatted_text += f"Assistant: {turn['value']}\n\n"
+        formatted_text = "".join([f"Human: {turn['value']}\n\nAssistant: {next((t['value'] for t in conversation[i+1:] if t['from'] == 'gpt'), '')}\n\n" 
+                                  for i, turn in enumerate(conversation) if turn['from'] == 'human'])
 
         encoded = self.tokenizer(formatted_text, truncation=True, max_length=self.max_length, padding='max_length', return_tensors='pt')
         
@@ -34,9 +29,9 @@ class OpenHermesDataset(Dataset):
         }
 
 def load_openhermes_data(tokenizer: AutoTokenizer, max_length: int, batch_size: int):
-    dataset = load_dataset("teknium/OpenHermes-2.5", split="train")
+    dataset = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True)
     openhermes_dataset = OpenHermesDataset(dataset, tokenizer, max_length)
-    dataloader = DataLoader(openhermes_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+    dataloader = DataLoader(openhermes_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
     return dataloader
 
 class MoELayer(torch.nn.Module):
@@ -55,8 +50,13 @@ class MoELayer(torch.nn.Module):
         top_k_probs, top_k_indices = torch.topk(router_probs, self.num_active_experts, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        expert_outputs = torch.stack([expert(x) for expert in self.experts])
-        outputs = torch.einsum('bne,bec->bnc', top_k_probs, expert_outputs[top_k_indices])
+        outputs = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            mask = top_k_indices == i
+            if mask.any():
+                expert_input = x[mask]
+                expert_output = expert(expert_input)
+                outputs[mask] += expert_output * top_k_probs[mask][:, i].unsqueeze(-1)
 
         return outputs
 
@@ -64,47 +64,63 @@ class MoELlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config: LlamaConfig, num_experts: int, num_active_experts: int):
         super().__init__(config)
         
-        # Replace MLP layers with MoE layers
         for layer in self.model.layers:
             input_dim = layer.mlp.gate_proj.in_features
             output_dim = layer.mlp.up_proj.out_features
             layer.mlp = MoELayer(input_dim, output_dim, num_experts, num_active_experts)
 
-def create_moe_model(model_or_name: str, num_experts: int, num_active_experts: int, device: torch.device) -> MoELlamaForCausalLM:
-    if isinstance(model_or_name, str):
-        # If a string is provided, assume it's a model name or path
-        config = LlamaConfig.from_pretrained(model_or_name)
-        original_model = LlamaForCausalLM.from_pretrained(model_or_name, device_map="auto", torch_dtype=torch.float16)
-
-    # Create the MoE model with the loaded configuration
-    moe_model = MoELlamaForCausalLM(config, num_experts, num_active_experts).to(device)
+def create_moe_model(model_name: str, num_experts: int, num_active_experts: int, device: torch.device) -> MoELlamaForCausalLM:
+    print("Loading configuration...")
+    config = LlamaConfig.from_pretrained(model_name)
     
-    # Transfer weights from the original model to the MoE model
-    moe_model_dict = moe_model.state_dict()
-    original_state_dict = original_model.state_dict()
+    print("Creating MoE model...")
+    moe_model = MoELlamaForCausalLM(config, num_experts, num_active_experts)
     
-    for name, param in original_state_dict.items():
-        if name in moe_model_dict and "mlp" not in name:
-            moe_model_dict[name].copy_(param)
+    print("Loading original model...")
+    original_model = LlamaForCausalLM.from_pretrained(
+        model_name,
+        device_map="cpu",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
     
-    # Initialize MoE layers
-    for name, module in moe_model.named_modules():
-        if isinstance(module, MoELayer):
-            original_mlp_prefix = name.replace("mlp", "mlp.gate_proj")
-            for i, expert in enumerate(module.experts):
-                expert.weight.data.copy_(original_state_dict[f"{original_mlp_prefix}.weight"])
-                if hasattr(expert, 'bias') and expert.bias is not None:
-                    expert.bias.data.copy_(original_state_dict[f"{original_mlp_prefix}.bias"])
-            
-            module.router.weight.data.normal_(mean=0.0, std=0.02)
-            if hasattr(module.router, 'bias') and module.router.bias is not None:
-                module.router.bias.data.zero_()
+    print("Transferring weights...")
+    with torch.no_grad():
+        for name, param in moe_model.named_parameters():
+            if "mlp" not in name:
+                param.data.copy_(original_model.state_dict()[name].to(dtype=torch.float32))
+        
+        for name, module in moe_model.named_modules():
+            if isinstance(module, MoELayer):
+                original_mlp_prefix = name.replace("mlp", "mlp.gate_proj")
+                original_weight = original_model.state_dict()[f"{original_mlp_prefix}.weight"].to(dtype=torch.float32)
+                
+                for expert in module.experts:
+                    expert.weight.data.copy_(original_weight)
+                    if hasattr(expert, 'bias') and expert.bias is not None:
+                        expert.bias.data.zero_()  # Initialize bias to zero if it exists
+                
+                module.router.weight.data.normal_(mean=0.0, std=0.02)
+                if hasattr(module.router, 'bias') and module.router.bias is not None:
+                    module.router.bias.data.zero_()
     
-    # Clear CUDA cache and garbage collect
+    print("Cleaning up...")
+    del original_model
     torch.cuda.empty_cache()
     gc.collect()
     
+    print("Moving MoE model to device...")
+    # Move model to GPU in chunks
+    for name, param in moe_model.named_parameters():
+        param.data = param.data.to(device)
+        torch.cuda.empty_cache()
+    
     return moe_model
+
+@torch.no_grad()
+def get_original_hidden_states(original_model, input_ids, attention_mask):
+    original_outputs = original_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+    return [h.detach() for h in original_outputs.hidden_states]
 
 def train_moe_model(original_model: LlamaForCausalLM, moe_model: MoELlamaForCausalLM, 
                     train_dataloader: DataLoader, num_epochs: int, 
@@ -112,16 +128,14 @@ def train_moe_model(original_model: LlamaForCausalLM, moe_model: MoELlamaForCaus
     original_model.to(device)
     moe_model.to(device)
     
-    # Freeze original model
     for param in original_model.parameters():
         param.requires_grad = False
     
-    # Freeze attention layers in MoE model
     for layer in moe_model.model.layers:
         for param in layer.self_attn.parameters():
             param.requires_grad = False
     
-    optimizer = torch.optim.AdamW(moe_model.parameters(), lr=1e-4)
+    optimizer = flora_opt.Flora(moe_model.parameters(), lr=1e-4)
     
     for epoch in range(num_epochs):
         moe_model.train()
@@ -131,17 +145,12 @@ def train_moe_model(original_model: LlamaForCausalLM, moe_model: MoELlamaForCaus
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            # Forward pass through both models
-            with torch.no_grad():
-                original_outputs = original_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            original_hidden_states = get_original_hidden_states(original_model, input_ids, attention_mask)
             moe_outputs = moe_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
             
-            # Compute loss based on hidden states
-            loss = 0
-            for orig_hidden, moe_hidden in zip(original_outputs.hidden_states, moe_outputs.hidden_states):
-                loss += torch.nn.functional.mse_loss(orig_hidden, moe_hidden)
+            loss = sum(torch.nn.functional.mse_loss(orig_hidden, moe_hidden) 
+                       for orig_hidden, moe_hidden in zip(original_hidden_states, moe_outputs.hidden_states))
             
-            # Backpropagate and update MoE model
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -150,20 +159,35 @@ def train_moe_model(original_model: LlamaForCausalLM, moe_model: MoELlamaForCaus
         
         print(f"Epoch {epoch+1}/{num_epochs}, Avg Loss: {total_loss / len(train_dataloader)}")
 
-# Usage example
-model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-num_experts = 8
-num_active_experts = 2
-max_length = 512
-batch_size = 2
+def main():
+    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    num_experts = 8
+    num_active_experts = 2
+    max_length = 512
+    batch_size = 2
+    num_epochs = 10
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-original_model = LlamaForCausalLM.from_pretrained(model_name)
-print('Llama created!')
-moe_model = create_moe_model(original_model, num_experts, num_active_experts,device)
-print('MOE created!')
-train_dataloader = load_openhermes_data(tokenizer, max_length, batch_size)
-print('training start!')
-train_moe_model(original_model, moe_model, train_dataloader, num_epochs=10, device=device)
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    print("Creating MoE model...")
+    moe_model = create_moe_model(model_name, num_experts, num_active_experts, device)
+    print("MoE model created!")
+
+    print("Loading original model for comparison...")
+    original_model = LlamaForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
+    print("Original model loaded!")
+
+    print("Preparing dataset...")
+    train_dataloader = load_openhermes_data(tokenizer, max_length, batch_size)
+    print("Dataset prepared!")
+
+    print("Starting training...")
+    train_moe_model(original_model, moe_model, train_dataloader, num_epochs, device)
+    print("Training completed!")
+
+if __name__ == "__main__":
+    main()
